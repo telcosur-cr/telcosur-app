@@ -416,6 +416,20 @@ if pagina == "📊 Dashboard":
     df_f = load_facturas()
     df_p = load_pagos()
 
+    # Filtro por tipo de red
+    tipos_red = ["Todas"]
+    if "Tipo de Red" in df_c.columns:
+        tipos_disponibles = sorted(df_c["Tipo de Red"].unique().tolist())
+        tipos_disponibles = [t for t in tipos_disponibles if t and t != ""]
+        tipos_red += tipos_disponibles
+    filtro_red = st.selectbox("🌐 Filtrar por Tipo de Red", tipos_red)
+
+    if filtro_red != "Todas" and "Tipo de Red" in df_c.columns:
+        df_c = df_c[df_c["Tipo de Red"] == filtro_red]
+        clientes_ids = set(df_c[COL_ID_CLIENTE].tolist())
+        df_f = df_f[df_f["cliente_id"].isin(clientes_ids)]
+        df_p = df_p[df_p["cliente_id"].isin(clientes_ids)]
+
     # KPIs principales
     activos   = filtrar_activos(df_c)
     inactivos = filtrar_inactivos(df_c)

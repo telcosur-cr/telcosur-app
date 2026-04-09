@@ -1,17 +1,9 @@
 """
-Sistema de Gestión Telcosur CR — v2.0 (Depurado)
-Requiere: pip install streamlit pandas plotly
+Sistema de Gestión Telcosur CR — v3.0 (Google Sheets + Nube)
+Requiere: pip install streamlit pandas plotly reportlab gspread google-auth
 Ejecutar: streamlit run app.py
 
-Changelog v2.0:
-  - FIX: parse_monto() ahora maneja correctamente ₡21.000, ₡24.500, etc.
-  - FIX: Nombres de columnas normalizados (sin espacios trailing)
-  - FIX: Estado "Activo " con espacio trailing se normaliza al cargar
-  - FIX: Columnas pagos.csv unificadas y consistentes
-  - FIX: Filtro de filas vacías/nan mejorado post dtype=str
-  - FIX: Generador de facturas normaliza Estado antes de comparar
-  - ADD: Validaciones más robustas en formularios
-  - ADD: Manejo seguro de columnas faltantes
+v3.0: Soporte dual Google Sheets (nube) / CSV (local)
 """
 
 import streamlit as st
@@ -21,9 +13,18 @@ import plotly.express as px
 from datetime import date, datetime
 import os
 import re
+import io
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.colors import HexColor
 from reportlab.pdfgen import canvas as pdf_canvas
+
+# Intentar importar gspread para Google Sheets
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_AVAILABLE = True
+except ImportError:
+    GSPREAD_AVAILABLE = False
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN
@@ -39,6 +40,70 @@ DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 CLIENTES_PATH  = os.path.join(DATA_DIR, "clientes.csv")
 FACTURAS_PATH  = os.path.join(DATA_DIR, "Facturacion_Proyectada_Telcosur.csv")
 PAGOS_PATH     = os.path.join(DATA_DIR, "pagos.csv")
+
+# ─────────────────────────────────────────────
+# GOOGLE SHEETS — Conexión
+# ─────────────────────────────────────────────
+USE_GSHEETS = False
+_gs_client = None
+_gs_spreadsheet = None
+
+SPREADSHEET_NAME = "Telcosur_DB"
+
+def _get_gsheets_client():
+    """Conecta a Google Sheets usando secrets de Streamlit."""
+    global _gs_client, _gs_spreadsheet, USE_GSHEETS
+    if _gs_client is not None:
+        return _gs_client, _gs_spreadsheet
+    try:
+        if not GSPREAD_AVAILABLE:
+            return None, None
+        if "gcp_service_account" not in st.secrets:
+            return None, None
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        _gs_client = gspread.authorize(creds)
+        _gs_spreadsheet = _gs_client.open(SPREADSHEET_NAME)
+        USE_GSHEETS = True
+        return _gs_client, _gs_spreadsheet
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ Google Sheets no disponible: {e}")
+        return None, None
+
+# Intentar conectar al inicio
+_get_gsheets_client()
+
+def _gs_read(sheet_name: str) -> pd.DataFrame:
+    """Lee una hoja de Google Sheets y retorna DataFrame."""
+    _, ss = _get_gsheets_client()
+    if ss is None:
+        return pd.DataFrame()
+    ws = ss.worksheet(sheet_name)
+    data = ws.get_all_records(default_blank="")
+    if not data:
+        return pd.DataFrame()
+    df = pd.DataFrame(data).astype(str)
+    return df
+
+def _gs_write(sheet_name: str, df: pd.DataFrame):
+    """Escribe un DataFrame completo a una hoja de Google Sheets."""
+    _, ss = _get_gsheets_client()
+    if ss is None:
+        return
+    ws = ss.worksheet(sheet_name)
+    ws.clear()
+    if df.empty:
+        ws.update([df.columns.tolist()], value_input_option="RAW")
+        return
+    # Convertir todo a string para evitar problemas
+    df_str = df.fillna("").astype(str)
+    data = [df_str.columns.tolist()] + df_str.values.tolist()
+    ws.update(data, value_input_option="RAW")
 
 # Constantes de columnas (nombres limpios, sin espacios trailing)
 COL_ID_CLIENTE = "ID Cliente"
@@ -158,30 +223,52 @@ def col_segura(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
 
 
 # ─────────────────────────────────────────────
-# CARGA / GUARDADO DE ARCHIVOS
+# CARGA / GUARDADO — Dual (Google Sheets o CSV)
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_clientes() -> pd.DataFrame:
+    if USE_GSHEETS:
+        df = _gs_read("clientes")
+        if not df.empty:
+            df = normalizar_df(df)
+            df = normalizar_estado(df)
+            df = df[~es_fila_vacia(df, COL_ID_CLIENTE)]
+            return df
+    # Fallback CSV
     df = pd.read_csv(CLIENTES_PATH, sep=";", encoding="utf-8-sig", dtype=str)
     df = normalizar_df(df)
     df = normalizar_estado(df)
-    # Eliminar filas sin ID
     df = df[~es_fila_vacia(df, COL_ID_CLIENTE)]
     return df
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_facturas() -> pd.DataFrame:
+    if USE_GSHEETS:
+        df = _gs_read("facturas")
+        if not df.empty:
+            df = normalizar_df(df)
+            df = normalizar_estado(df)
+            df = df[~es_fila_vacia(df, "factura_id")]
+            return df
+    # Fallback CSV
     df = pd.read_csv(FACTURAS_PATH, encoding="utf-8-sig", dtype=str)
     df = normalizar_df(df)
     df = normalizar_estado(df)
-    # Eliminar filas sin factura_id
     df = df[~es_fila_vacia(df, "factura_id")]
     return df
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=30)
 def load_pagos() -> pd.DataFrame:
+    if USE_GSHEETS:
+        df = _gs_read("pagos")
+        if not df.empty:
+            df = normalizar_df(df)
+            if "numero_pago_cliente" not in df.columns:
+                df["numero_pago_cliente"] = ""
+            return df
+    # Fallback CSV
     if not os.path.exists(PAGOS_PATH):
         df = pd.DataFrame(columns=[
             "pago_id", "factura_id", "cliente_id", "nombre_cliente",
@@ -191,24 +278,32 @@ def load_pagos() -> pd.DataFrame:
         return df
     df = pd.read_csv(PAGOS_PATH, dtype=str, encoding="utf-8-sig")
     df = normalizar_df(df)
-    # Asegurar que la columna existe (compatibilidad con archivos viejos)
     if "numero_pago_cliente" not in df.columns:
         df["numero_pago_cliente"] = ""
     return df
 
 
 def save_clientes(df: pd.DataFrame):
-    df.to_csv(CLIENTES_PATH, sep=";", index=False, encoding="utf-8-sig")
+    if USE_GSHEETS:
+        _gs_write("clientes", df)
+    else:
+        df.to_csv(CLIENTES_PATH, sep=";", index=False, encoding="utf-8-sig")
     st.cache_data.clear()
 
 
 def save_facturas(df: pd.DataFrame):
-    df.to_csv(FACTURAS_PATH, index=False, encoding="utf-8-sig")
+    if USE_GSHEETS:
+        _gs_write("facturas", df)
+    else:
+        df.to_csv(FACTURAS_PATH, index=False, encoding="utf-8-sig")
     st.cache_data.clear()
 
 
 def save_pagos(df: pd.DataFrame):
-    df.to_csv(PAGOS_PATH, index=False, encoding="utf-8-sig")
+    if USE_GSHEETS:
+        _gs_write("pagos", df)
+    else:
+        df.to_csv(PAGOS_PATH, index=False, encoding="utf-8-sig")
     st.cache_data.clear()
 
 
@@ -252,6 +347,10 @@ st.markdown("""
 # ─────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 📡 Telcosur CR")
+    if USE_GSHEETS:
+        st.caption("☁️ Conectado a Google Sheets")
+    else:
+        st.caption("💻 Modo local (CSV)")
     st.markdown("---")
     pagina = st.radio("Navegación", [
         "📊 Dashboard",
@@ -275,6 +374,36 @@ def filtrar_activos(df: pd.DataFrame) -> pd.DataFrame:
 def filtrar_inactivos(df: pd.DataFrame) -> pd.DataFrame:
     """Retorna clientes con Estado != 'Activo'."""
     return df[df[COL_ESTADO].str.lower().str.strip() != ESTADO_ACTIVO]
+
+
+# ─────────────────────────────────────────────
+# MIGRACIÓN INICIAL: CSV → Google Sheets
+# ─────────────────────────────────────────────
+if USE_GSHEETS:
+    # Si la hoja de clientes está vacía, migrar desde CSV
+    _test = _gs_read("clientes")
+    if _test.empty or len(_test) == 0:
+        with st.spinner("☁️ Migrando datos a Google Sheets por primera vez..."):
+            try:
+                # Cargar desde CSV local o de GitHub
+                if os.path.exists(CLIENTES_PATH):
+                    df_mig_c = pd.read_csv(CLIENTES_PATH, sep=";", encoding="utf-8-sig", dtype=str)
+                    df_mig_c = normalizar_df(df_mig_c)
+                    df_mig_c = normalizar_estado(df_mig_c)
+                    df_mig_c = df_mig_c[~es_fila_vacia(df_mig_c, COL_ID_CLIENTE)]
+                    _gs_write("clientes", df_mig_c)
+                if os.path.exists(FACTURAS_PATH):
+                    df_mig_f = pd.read_csv(FACTURAS_PATH, encoding="utf-8-sig", dtype=str)
+                    df_mig_f = normalizar_df(df_mig_f)
+                    _gs_write("facturas", df_mig_f)
+                if os.path.exists(PAGOS_PATH):
+                    df_mig_p = pd.read_csv(PAGOS_PATH, dtype=str, encoding="utf-8-sig")
+                    df_mig_p = normalizar_df(df_mig_p)
+                    _gs_write("pagos", df_mig_p)
+                st.success("✅ Datos migrados a Google Sheets exitosamente.")
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"Error migrando datos: {e}")
 
 
 # ═════════════════════════════════════════════

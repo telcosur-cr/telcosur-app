@@ -233,6 +233,50 @@ COL_FECHA_1FAC = "Fecha Primer Factura"
 # Estado activo normalizado
 ESTADO_ACTIVO = "activo"
 
+# Reglas de vencimiento de facturas
+DIAS_EN_COBRO = 7     # Días de gracia para pagar desde emisión
+DIAS_PARA_BAJA = 10   # Días desde emisión para generar correo de baja (7+3)
+
+
+def calcular_estado_factura(row):
+    """
+    Calcula el estado dinámico de una factura según reglas de negocio:
+    - Pagada: ya fue pagada
+    - En Cobro: dentro de los 7 días de gracia
+    - Vencida: pasaron más de 7 días sin pago
+    - Requiere Baja: pasaron más de 10 días sin pago (candidata a desconexión)
+    """
+    estado = str(row.get("estado_factura", "")).strip().lower()
+    if estado == "pagada":
+        return "Pagada"
+    if estado == "anulada":
+        return "Anulada"
+    
+    fecha_fac = pd.to_datetime(row.get("fecha_factura", ""), errors="coerce")
+    if pd.isna(fecha_fac):
+        return "Pendiente"
+    
+    hoy = pd.Timestamp.now().normalize()
+    dias_transcurridos = (hoy - fecha_fac).days
+    
+    if dias_transcurridos <= DIAS_EN_COBRO:
+        return "En Cobro"
+    elif dias_transcurridos <= DIAS_PARA_BAJA:
+        return "Vencida"
+    else:
+        return "Vencida"  # Más de 10 días
+
+
+def facturas_requieren_baja(df_f):
+    """Retorna facturas que llevan más de DIAS_PARA_BAJA sin pagar."""
+    hoy = pd.Timestamp.now().normalize()
+    pendientes = df_f[df_f["estado_factura"].str.lower().isin(["pendiente", "en cobro", "vencida"])].copy()
+    if pendientes.empty:
+        return pd.DataFrame()
+    pendientes["_fecha_dt"] = pd.to_datetime(pendientes["fecha_factura"], errors="coerce")
+    pendientes["_dias"] = (hoy - pendientes["_fecha_dt"]).dt.days
+    return pendientes[pendientes["_dias"] > DIAS_PARA_BAJA]
+
 
 # ─────────────────────────────────────────────
 # HELPERS DE MONTO
@@ -358,12 +402,22 @@ def load_facturas() -> pd.DataFrame:
             df = normalizar_df(df)
             df = normalizar_estado(df)
             df = df[~es_fila_vacia(df, "factura_id")]
+            # Calcular estado dinámico para facturas no pagadas
+            df["estado_factura"] = df.apply(
+                lambda r: calcular_estado_factura(r) if r["estado_factura"].lower() not in ("pagada", "anulada") else r["estado_factura"],
+                axis=1,
+            )
             return df
     # Fallback CSV
     df = pd.read_csv(FACTURAS_PATH, encoding="utf-8-sig", dtype=str)
     df = normalizar_df(df)
     df = normalizar_estado(df)
     df = df[~es_fila_vacia(df, "factura_id")]
+    # Calcular estado dinámico
+    df["estado_factura"] = df.apply(
+        lambda r: calcular_estado_factura(r) if r["estado_factura"].lower() not in ("pagada", "anulada") else r["estado_factura"],
+        axis=1,
+    )
     return df
 
 
@@ -724,53 +778,110 @@ if pagina == "📊 Dashboard":
     # ── Resumen de Estado de Facturas ──
     st.subheader("🧾 Estado de Facturas")
 
-    # Conteo y monto por estado
+    mes_actual = datetime.now().strftime("%Y-%m")
     df_f_stats = df_f.copy()
     df_f_stats["monto_num"] = df_f_stats[COL_MONTO].apply(parse_monto)
-    estado_resumen = (
-        df_f_stats.groupby("estado_factura")
-        .agg(cantidad=("factura_id", "count"), monto_total=("monto_num", "sum"))
-        .reset_index()
-        .sort_values("cantidad", ascending=False)
-    )
+    df_f_stats["_mes"] = pd.to_datetime(df_f_stats["fecha_factura"], errors="coerce").dt.to_period("M").astype(str)
 
-    # Mostrar tarjetas por estado
-    estados_cols = st.columns(len(estado_resumen) if len(estado_resumen) <= 5 else 5)
-    color_estado = {
-        "pendiente": "#fb923c",
-        "pagada": "#4ade80",
-        "anulada": "#94a3b8",
-    }
-    for i, (_, row_e) in enumerate(estado_resumen.iterrows()):
-        est = row_e["estado_factura"]
-        cant = int(row_e["cantidad"])
-        monto = row_e["monto_total"]
-        c_est = color_estado.get(est.lower(), "#38bdf8")
-        col_idx = i % len(estados_cols)
-        estados_cols[col_idx].markdown(f"""
-        <div class='metric-card'>
-            <div class='metric-value' style='color:{c_est}; font-size:1.6rem;'>{cant}</div>
-            <div class='metric-label'>{est} — {fmt_colones(monto)}</div>
-        </div>""", unsafe_allow_html=True)
+    # Clasificar con nuevos estados dinámicos
+    pagadas_mes = df_f_stats[(df_f_stats["estado_factura"] == "Pagada") & (df_f_stats["_mes"] == mes_actual)]
+    en_cobro = df_f_stats[df_f_stats["estado_factura"] == "En Cobro"]
+    vencidas = df_f_stats[df_f_stats["estado_factura"] == "Vencida"]
+    anuladas = df_f_stats[df_f_stats["estado_factura"] == "Anulada"]
 
-    # Gráfico de dona con estados
+    # Clientes candidatos a baja (>10 días)
+    requieren_baja = facturas_requieren_baja(df_f)
+
+    ef1, ef2, ef3, ef4 = st.columns(4)
+    ef1.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-value' style='color:#4ade80; font-size:1.5rem;'>{len(pagadas_mes)}</div>
+        <div class='metric-label'>Pagadas {mes_actual}</div>
+        <div class='metric-label'>{fmt_colones(pagadas_mes["monto_num"].sum())}</div>
+    </div>""", unsafe_allow_html=True)
+    ef2.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-value' style='color:#38bdf8; font-size:1.5rem;'>{len(en_cobro)}</div>
+        <div class='metric-label'>En Cobro (≤7 días)</div>
+        <div class='metric-label'>{fmt_colones(en_cobro["monto_num"].sum())}</div>
+    </div>""", unsafe_allow_html=True)
+    ef3.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-value' style='color:#f87171; font-size:1.5rem;'>{len(vencidas)}</div>
+        <div class='metric-label'>Vencidas (&gt;7 días)</div>
+        <div class='metric-label'>{fmt_colones(vencidas["monto_num"].sum())}</div>
+    </div>""", unsafe_allow_html=True)
+    ef4.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-value' style='color:#94a3b8; font-size:1.5rem;'>{len(anuladas)}</div>
+        <div class='metric-label'>Anuladas</div>
+        <div class='metric-label'>{fmt_colones(anuladas["monto_num"].sum())}</div>
+    </div>""", unsafe_allow_html=True)
+
+    # Gráfico de dona
+    labels_ef = ["Pagadas (mes actual)", "En Cobro", "Vencidas"]
+    values_ef = [len(pagadas_mes), len(en_cobro), len(vencidas)]
+    colors_ef = ["#4ade80", "#38bdf8", "#f87171"]
+    if len(anuladas) > 0:
+        labels_ef.append("Anuladas")
+        values_ef.append(len(anuladas))
+        colors_ef.append("#94a3b8")
+
     fig_dona = go.Figure(data=[go.Pie(
-        labels=estado_resumen["estado_factura"],
-        values=estado_resumen["cantidad"],
-        hole=0.5,
-        marker_colors=[color_estado.get(e.lower(), "#38bdf8") for e in estado_resumen["estado_factura"]],
-        textinfo="label+percent+value",
-        textfont_size=13,
+        labels=labels_ef, values=values_ef, hole=0.5,
+        marker_colors=colors_ef,
+        textinfo="label+percent+value", textfont_size=12,
     )])
     fig_dona.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font_color="#cbd5e1",
-        showlegend=False,
-        height=300,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font_color="#cbd5e1", showlegend=False, height=300,
         margin=dict(l=20, r=20, t=20, b=20),
     )
     st.plotly_chart(fig_dona, use_container_width=True)
+
+    # ── Alerta de clientes para baja ──
+    if not requieren_baja.empty:
+        st.markdown("---")
+        st.subheader("⚠️ Clientes Candidatos a Desconexión (+10 días sin pagar)")
+        baja_resumen = requieren_baja.groupby(["cliente_id", COL_NOMBRE]).agg(
+            facturas_vencidas=("factura_id", "count"),
+            monto_total=("Monto Mensual de Facturacion", lambda x: sum(parse_monto(v) for v in x)),
+            dias_max=("_dias", "max"),
+        ).reset_index().sort_values("dias_max", ascending=False)
+        baja_resumen["monto_fmt"] = baja_resumen["monto_total"].apply(fmt_colones)
+
+        st.dataframe(
+            baja_resumen[["cliente_id", COL_NOMBRE, "facturas_vencidas", "monto_fmt", "dias_max"]]
+            .rename(columns={"cliente_id": "ID", COL_NOMBRE: "Cliente",
+                             "facturas_vencidas": "Fact. Vencidas", "monto_fmt": "Monto",
+                             "dias_max": "Días sin Pagar"}),
+            use_container_width=True, hide_index=True,
+        )
+
+        # Generar correo para TI
+        with st.expander("📧 Generar Correo de Baja para TI"):
+            clientes_baja_list = baja_resumen.apply(
+                lambda r: f"• {r['cliente_id']} – {r[COL_NOMBRE]} ({int(r['facturas_vencidas'])} facturas, {r['monto_fmt']}, {int(r['dias_max'])} días)",
+                axis=1,
+            ).tolist()
+            correo_body = f"""Asunto: Solicitud de Desconexión – Clientes con Facturación Vencida
+
+Estimado equipo de TI,
+
+Los siguientes clientes tienen facturas vencidas con más de {DIAS_PARA_BAJA} días sin pagar. Se solicita proceder con la desconexión del servicio según protocolo:
+
+{chr(10).join(clientes_baja_list)}
+
+Total clientes a desconectar: {len(baja_resumen)}
+Monto total en mora: {fmt_colones(baja_resumen["monto_total"].sum())}
+
+Fecha de generación: {datetime.now().strftime('%d/%m/%Y %H:%M')}
+
+Saludos,
+Departamento de Cobros – Telcosur CR"""
+
+            st.text_area("Correo generado (copiar y enviar)", value=correo_body, height=300)
+            st.caption("Copiá este texto y envialo a contacto@telcosur.net")
 
     st.markdown("---")
 
@@ -1033,7 +1144,7 @@ elif pagina == "📄 Facturas":
 
     # Filtros
     fc1, fc2, fc3 = st.columns(3)
-    filt_estado = fc1.selectbox("Estado", ["Todos", "Pendiente", "Pagada", "Anulada"])
+    filt_estado = fc1.selectbox("Estado", ["Todos", "En Cobro", "Vencida", "Pagada", "Anulada"])
     # Generar lista de meses disponibles
     df_f["_fecha_dt"] = pd.to_datetime(df_f["fecha_factura"], errors="coerce")
     meses_disponibles = sorted(df_f["_fecha_dt"].dt.to_period("M").dropna().astype(str).unique().tolist(), reverse=True)
@@ -1101,7 +1212,7 @@ elif pagina == "📄 Facturas":
         )
 
         ecol1, ecol2, ecol3 = st.columns(3)
-        estados_fac = ["Pendiente", "Pagada", "Anulada"]
+        estados_fac = ["En Cobro", "Vencida", "Pagada", "Anulada"]
         estado_actual = row["estado_factura"].strip()
         idx_estado = estados_fac.index(estado_actual) if estado_actual in estados_fac else 0
         nuevo_estado = ecol1.selectbox("Nuevo Estado", estados_fac, index=idx_estado)
@@ -1112,6 +1223,13 @@ elif pagina == "📄 Facturas":
         num_pago_cliente = st.text_input(
             "Número de Pago / Comprobante del Cliente",
             placeholder="Ej: 202603…1234 o número de SINPE",
+        )
+
+        # Upload de comprobante
+        archivo_comprobante = st.file_uploader(
+            "📎 Adjuntar comprobante de pago (opcional)",
+            type=["pdf", "jpg", "jpeg", "png"],
+            key="comprobante_factura",
         )
 
         if st.button("💾 Guardar Cambios", type="primary"):
@@ -1139,6 +1257,22 @@ elif pagina == "📄 Facturas":
                 save_pagos(df_p)
                 st.success(f"💰 Pago de {fmt_colones(monto_pago)} registrado.")
 
+                # Subir comprobante al Drive si se adjuntó
+                if archivo_comprobante is not None:
+                    tipo_red = str(row.get("Estado", "FTTH"))
+                    # Buscar tipo de red del cliente
+                    df_cli_temp = load_clientes()
+                    cli_match = df_cli_temp[df_cli_temp[COL_ID_CLIENTE] == str(row["cliente_id"])]
+                    tipo_red_cli = cli_match.iloc[0].get("Tipo de Red", "FTTH") if not cli_match.empty else "FTTH"
+                    
+                    folders = drive_get_client_folder(str(row["cliente_id"]), str(row[COL_NOMBRE]), tipo_red_cli)
+                    if folders and folders.get("comprobantes"):
+                        ext = archivo_comprobante.name.split(".")[-1]
+                        nombre_archivo = f"Comprobante_{mes_facturado}_{num_pago_cliente.strip()[:20]}.{ext}"
+                        result = drive_upload_file(archivo_comprobante.read(), nombre_archivo, folders["comprobantes"])
+                        if result:
+                            st.success(f"📎 Comprobante subido a Drive: {nombre_archivo}")
+
             save_facturas(df_f)
             st.success(f"✅ Factura {fac_id_sel} actualizada a '{nuevo_estado}'.")
             st.rerun()
@@ -1152,8 +1286,12 @@ elif pagina == "👤 Clientes":
 
     df_c = load_clientes()
 
-    # Filtro
-    filt = st.text_input("🔍 Buscar por nombre o ID")
+    # Filtros
+    filt_c1, filt_c2, filt_c3 = st.columns([3, 1, 1])
+    filt = filt_c1.text_input("🔍 Buscar por nombre o ID")
+    filtro_red_cli = filt_c2.selectbox("Tipo de Red", ["Todas"] + sorted([t for t in df_c.get("Tipo de Red", pd.Series()).unique() if t and t != ""]), key="filt_red_cli")
+    filtro_est_cli = filt_c3.selectbox("Estado", ["Todos", "Activo", "DX - Al Dia", "DX - No Pago", "DX - Cortesia", "DX - Cambio Proveedor", "DX - Mudanza", "DX - Problemas Técnicos", "DX - Otro"], key="filt_est_cli")
+
     df_view = df_c.copy()
     if filt.strip():
         mask = (
@@ -1161,12 +1299,53 @@ elif pagina == "👤 Clientes":
             df_view[COL_ID_CLIENTE].str.lower().str.contains(filt.lower(), na=False)
         )
         df_view = df_view[mask]
+    if filtro_red_cli != "Todas" and "Tipo de Red" in df_view.columns:
+        df_view = df_view[df_view["Tipo de Red"] == filtro_red_cli]
+    if filtro_est_cli != "Todos":
+        df_view = df_view[df_view[COL_ESTADO] == filtro_est_cli]
 
-    cols_show = [COL_ID_CLIENTE, COL_NOMBRE, COL_TELEFONO, COL_CELULAR,
-                 COL_MONTO, COL_ESTADO, COL_VENDEDOR, COL_NODO]
+    cols_show = [COL_ID_CLIENTE, COL_NOMBRE, "Tipo de Red", COL_TELEFONO, COL_CELULAR,
+                 COL_MEGAS, COL_TV, COL_MONTO, COL_ESTADO, COL_VENDEDOR, COL_NODO, COL_CORREO]
     cols_show = [c for c in cols_show if c in df_view.columns]
     st.dataframe(df_view[cols_show], use_container_width=True, hide_index=True)
     st.caption(f"Total: {len(df_view)} clientes")
+
+    # Detalle de un cliente
+    with st.expander("📋 Ver detalle de un cliente"):
+        opciones_det = df_view.apply(lambda r: f"{r[COL_ID_CLIENTE]} – {r[COL_NOMBRE]}", axis=1).tolist()
+        if opciones_det:
+            sel_det = st.selectbox("Seleccionar cliente", opciones_det, key="detalle_sel")
+            det_id = sel_det.split(" – ")[0].strip()
+            det_row = df_c[df_c[COL_ID_CLIENTE] == det_id].iloc[0]
+            d1, d2 = st.columns(2)
+            d1.markdown(f"""
+            **ID:** {det_row.get(COL_ID_CLIENTE, '')}  
+            **Nombre:** {det_row.get(COL_NOMBRE, '')}  
+            **Cédula:** {det_row.get(COL_CEDULA, '')}  
+            **Teléfono:** {det_row.get(COL_TELEFONO, '')}  
+            **Celular:** {det_row.get(COL_CELULAR, '')}  
+            **Correo:** {det_row.get(COL_CORREO, '')}  
+            **Dirección:** {det_row.get('Dirrecion', '')}
+            """)
+            d2.markdown(f"""
+            **Tipo de Red:** {det_row.get('Tipo de Red', '')}  
+            **Megas:** {det_row.get(COL_MEGAS, '')} Mbps  
+            **TV:** {det_row.get(COL_TV, '')}  
+            **Monto Mensual:** ₡{det_row.get(COL_MONTO, '')}  
+            **Estado:** {det_row.get(COL_ESTADO, '')}  
+            **Vendedor:** {det_row.get(COL_VENDEDOR, '')}  
+            **Nodo:** {det_row.get(COL_NODO, '')}
+            """)
+            d3, d4 = st.columns(2)
+            d3.markdown(f"""
+            **Fecha Contrato:** {det_row.get('Fecha Contrato', '')}  
+            **Fecha Instalación:** {det_row.get('Fecha Instalacion', '')}  
+            **Fecha 1ra Factura:** {det_row.get(COL_FECHA_1FAC, '')}
+            """)
+            d4.markdown(f"""
+            **Fecha Desconexión:** {det_row.get(COL_FECHA_DX, '')}  
+            **Notas:** {det_row.get(COL_NOTAS, '')}
+            """)
 
     st.markdown("---")
     tab_edit, tab_alta, tab_baja, tab_docs = st.tabs(["✏️ Editar Cliente", "➕ Alta de Cliente", "🚫 Dar de Baja", "📂 Documentos"])
@@ -1251,6 +1430,11 @@ elif pagina == "👤 Clientes":
         a_fecha_instalacion = ac_f2.date_input("Fecha Instalación", value=date.today())
         a_fecha_primer_fact = ac_f3.date_input("Fecha Primer Factura", value=date.today())
 
+        st.markdown("**📎 Documentos del cliente (opcional)**")
+        doc_c1, doc_c2 = st.columns(2)
+        a_contrato = doc_c1.file_uploader("Contrato firmado", type=["pdf", "jpg", "jpeg", "png"], key="alta_contrato")
+        a_cedula_doc = doc_c2.file_uploader("Cédula / Identificación", type=["pdf", "jpg", "jpeg", "png"], key="alta_cedula")
+
         if st.button("➕ Registrar Cliente", type="primary"):
             if not a_nombre.strip():
                 st.error("El Nombre es obligatorio.")
@@ -1278,6 +1462,24 @@ elif pagina == "👤 Clientes":
                 df_c = pd.concat([df_c, pd.DataFrame([nueva_fila])], ignore_index=True)
                 save_clientes(df_c)
                 st.success(f"✅ Cliente {nuevo_id} – {a_nombre} registrado como {a_tipo_red}.")
+
+                # Subir documentos al Drive si se adjuntaron
+                if a_contrato is not None or a_cedula_doc is not None:
+                    folders = drive_get_client_folder(nuevo_id, a_nombre.strip(), a_tipo_red)
+                    if folders:
+                        if a_contrato is not None:
+                            ext = a_contrato.name.split(".")[-1]
+                            nombre_contrato = f"Contrato_{date.today().strftime('%Y%m%d')}.{ext}"
+                            result = drive_upload_file(a_contrato.read(), nombre_contrato, folders["contratos"])
+                            if result:
+                                st.success(f"📎 Contrato subido: {nombre_contrato}")
+                        if a_cedula_doc is not None:
+                            ext = a_cedula_doc.name.split(".")[-1]
+                            nombre_ced = f"Cedula_{date.today().strftime('%Y%m%d')}.{ext}"
+                            result = drive_upload_file(a_cedula_doc.read(), nombre_ced, folders["documentos"])
+                            if result:
+                                st.success(f"📎 Cédula subida: {nombre_ced}")
+
                 st.rerun()
 
     # ── Baja ──

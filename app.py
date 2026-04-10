@@ -105,6 +105,114 @@ def _gs_write(sheet_name: str, df: pd.DataFrame):
     data = [df_str.columns.tolist()] + df_str.values.tolist()
     ws.update(data, value_input_option="RAW")
 
+
+# ─────────────────────────────────────────────
+# GOOGLE DRIVE — Carpetas y Archivos
+# ─────────────────────────────────────────────
+DRIVE_ROOT_FOLDER_ID = "1UQocuFxpKZZfrnbuKBbwhL8tDBx-NtXz"
+
+def _get_drive_service():
+    """Retorna el servicio de Google Drive autenticado."""
+    try:
+        if "gcp_service_account" not in st.secrets:
+            return None
+        from googleapiclient.discovery import build
+        creds = Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        return build("drive", "v3", credentials=creds)
+    except Exception:
+        return None
+
+def _drive_find_folder(service, name, parent_id):
+    """Busca una carpeta por nombre dentro de un parent. Retorna ID o None."""
+    try:
+        query = f"name='{name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        results = service.files().list(q=query, fields="files(id,name)", pageSize=1).execute()
+        files = results.get("files", [])
+        return files[0]["id"] if files else None
+    except Exception:
+        return None
+
+def _drive_create_folder(service, name, parent_id):
+    """Crea una carpeta en Drive. Retorna el ID."""
+    try:
+        metadata = {
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }
+        folder = service.files().create(body=metadata, fields="id").execute()
+        return folder.get("id")
+    except Exception:
+        return None
+
+def _drive_get_or_create_folder(service, name, parent_id):
+    """Busca carpeta, si no existe la crea."""
+    folder_id = _drive_find_folder(service, name, parent_id)
+    if folder_id:
+        return folder_id
+    return _drive_create_folder(service, name, parent_id)
+
+def drive_get_client_folder(cliente_id, nombre_cliente, tipo_red):
+    """
+    Obtiene o crea la estructura de carpetas para un cliente:
+    Telcosur_Clientes / {Tipo de Red} / {ID - Nombre} / (Contratos, Comprobantes, Documentos)
+    Retorna dict con IDs de las subcarpetas.
+    """
+    service = _get_drive_service()
+    if service is None:
+        return None
+
+    # Carpeta tipo de red
+    red_folder = _drive_get_or_create_folder(service, tipo_red, DRIVE_ROOT_FOLDER_ID)
+    if not red_folder:
+        return None
+
+    # Carpeta del cliente
+    nombre_limpio = nombre_cliente[:40].strip().replace("/", "-")
+    folder_name = f"{cliente_id} - {nombre_limpio}"
+    client_folder = _drive_get_or_create_folder(service, folder_name, red_folder)
+    if not client_folder:
+        return None
+
+    # Subcarpetas
+    contratos_id = _drive_get_or_create_folder(service, "Contratos", client_folder)
+    comprobantes_id = _drive_get_or_create_folder(service, "Comprobantes", client_folder)
+    documentos_id = _drive_get_or_create_folder(service, "Documentos", client_folder)
+
+    return {
+        "cliente": client_folder,
+        "contratos": contratos_id,
+        "comprobantes": comprobantes_id,
+        "documentos": documentos_id,
+    }
+
+def drive_upload_file(file_data, filename, folder_id, mime_type=None):
+    """Sube un archivo a una carpeta de Drive. Retorna el ID del archivo."""
+    service = _get_drive_service()
+    if service is None:
+        return None
+    try:
+        from googleapiclient.http import MediaIoBaseUpload
+        metadata = {"name": filename, "parents": [folder_id]}
+        if mime_type is None:
+            if filename.lower().endswith(".pdf"):
+                mime_type = "application/pdf"
+            elif filename.lower().endswith((".jpg", ".jpeg")):
+                mime_type = "image/jpeg"
+            elif filename.lower().endswith(".png"):
+                mime_type = "image/png"
+            else:
+                mime_type = "application/octet-stream"
+        media = MediaIoBaseUpload(io.BytesIO(file_data), mimetype=mime_type)
+        uploaded = service.files().create(body=metadata, media_body=media, fields="id,webViewLink").execute()
+        return uploaded
+    except Exception as e:
+        st.error(f"Error subiendo archivo: {e}")
+        return None
+
 # Constantes de columnas (nombres limpios, sin espacios trailing)
 COL_ID_CLIENTE = "ID Cliente"
 COL_NOMBRE     = "Nombre del cliente"
@@ -451,6 +559,110 @@ if pagina == "📊 Dashboard":
             <div class='metric-value' style='color:{color}'>{val}</div>
             <div class='metric-label'>{label}</div>
         </div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # ── Distribución por Tipo de Red ──
+    st.subheader("🌐 Clientes por Tipo de Red")
+
+    if "Tipo de Red" in activos.columns:
+        activos_red = activos.copy()
+        activos_red["monto_n"] = activos_red[COL_MONTO].apply(parse_monto)
+        por_red = (
+            activos_red.groupby("Tipo de Red")
+            .agg(clientes=(COL_ID_CLIENTE, "count"), ingreso=("monto_n", "sum"))
+            .reset_index()
+            .sort_values("clientes", ascending=False)
+        )
+        por_red = por_red[por_red["Tipo de Red"] != ""]
+
+        if not por_red.empty:
+            colores_red = {"FTTH": "#38bdf8", "Inalambrico": "#4ade80",
+                           "TerraNetwork": "#a78bfa", "Empresarial": "#fb923c"}
+
+            # Tarjetas
+            red_cols = st.columns(len(por_red) if len(por_red) <= 4 else 4)
+            for i, (_, rr) in enumerate(por_red.iterrows()):
+                tipo = rr["Tipo de Red"]
+                cli = int(rr["clientes"])
+                ing = fmt_colones(rr["ingreso"])
+                c_red = colores_red.get(tipo, "#94a3b8")
+                red_cols[i % len(red_cols)].markdown(f"""
+                <div class='metric-card'>
+                    <div class='metric-value' style='color:{c_red}; font-size:1.4rem;'>{tipo}</div>
+                    <div class='metric-label'>{cli} clientes</div>
+                    <div class='metric-label'>Ingreso: {ing}/mes</div>
+                </div>""", unsafe_allow_html=True)
+
+            # Gráfico doble: barras clientes + barras ingreso
+            fig_red = go.Figure()
+            fig_red.add_bar(
+                x=por_red["Tipo de Red"], y=por_red["clientes"],
+                name="Clientes", marker_color=[colores_red.get(t, "#94a3b8") for t in por_red["Tipo de Red"]],
+                text=por_red["clientes"], textposition="outside",
+                yaxis="y",
+            )
+            fig_red.add_bar(
+                x=por_red["Tipo de Red"], y=por_red["ingreso"],
+                name="Ingreso Mensual (₡)", marker_color=[colores_red.get(t, "#94a3b8") for t in por_red["Tipo de Red"]],
+                text=por_red["ingreso"].apply(fmt_colones), textposition="outside",
+                yaxis="y2", opacity=0.5,
+            )
+            fig_red.update_layout(
+                barmode="group",
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#cbd5e1",
+                yaxis=dict(title="Clientes", side="left"),
+                yaxis2=dict(title="Ingreso (₡)", side="right", overlaying="y"),
+                legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h", y=-0.15),
+                height=350, margin=dict(l=10, r=10, t=10, b=10),
+            )
+            st.plotly_chart(fig_red, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── KPI de TV ──
+    st.subheader("📺 Clientes con Servicio de TV")
+
+    activos_tv = activos.copy()
+    activos_tv["tv_n"] = pd.to_numeric(col_segura(activos_tv, COL_TV), errors="coerce").fillna(0).astype(int)
+    con_tv = activos_tv[activos_tv["tv_n"] > 0]
+    sin_tv = activos_tv[activos_tv["tv_n"] == 0]
+
+    tv1, tv2, tv3 = st.columns(3)
+    tv1.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-value' style='color:#a78bfa; font-size:1.8rem;'>{len(con_tv)}</div>
+        <div class='metric-label'>Con TV</div>
+    </div>""", unsafe_allow_html=True)
+    tv2.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-value' style='color:#94a3b8; font-size:1.8rem;'>{len(sin_tv)}</div>
+        <div class='metric-label'>Sin TV</div>
+    </div>""", unsafe_allow_html=True)
+    pct_tv = (len(con_tv) / len(activos) * 100) if len(activos) > 0 else 0
+    tv3.markdown(f"""
+    <div class='metric-card'>
+        <div class='metric-value' style='color:#4ade80; font-size:1.8rem;'>{pct_tv:.1f}%</div>
+        <div class='metric-label'>Penetración TV</div>
+    </div>""", unsafe_allow_html=True)
+
+    # Gráfico dona TV
+    if len(activos) > 0:
+        fig_tv = go.Figure(data=[go.Pie(
+            labels=["Con TV", "Sin TV"],
+            values=[len(con_tv), len(sin_tv)],
+            hole=0.5,
+            marker_colors=["#a78bfa", "#334155"],
+            textinfo="label+percent+value",
+            textfont_size=13,
+        )])
+        fig_tv.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#cbd5e1", showlegend=False, height=280,
+            margin=dict(l=20, r=20, t=20, b=20),
+        )
+        st.plotly_chart(fig_tv, use_container_width=True)
 
     st.markdown("---")
 
@@ -822,17 +1034,19 @@ elif pagina == "📄 Facturas":
     # Filtros
     fc1, fc2, fc3 = st.columns(3)
     filt_estado = fc1.selectbox("Estado", ["Todos", "Pendiente", "Pagada", "Anulada"])
-    filt_mes    = fc2.text_input("Mes (YYYY-MM)", placeholder="2026-03")
+    # Generar lista de meses disponibles
+    df_f["_fecha_dt"] = pd.to_datetime(df_f["fecha_factura"], errors="coerce")
+    meses_disponibles = sorted(df_f["_fecha_dt"].dt.to_period("M").dropna().astype(str).unique().tolist(), reverse=True)
+    filt_mes = fc2.selectbox("Mes", ["Todos"] + meses_disponibles)
     filt_nombre = fc3.text_input("Buscar cliente")
 
     df_view = df_f.copy()
     if filt_estado != "Todos":
         df_view = df_view[df_view["estado_factura"].str.lower() == filt_estado.lower()]
-    if filt_mes.strip():
-        df_view["_fecha_dt"] = pd.to_datetime(df_view["fecha_factura"], errors="coerce")
-        df_view["_mes"] = df_view["_fecha_dt"].dt.to_period("M").astype(str)
-        df_view = df_view[df_view["_mes"] == filt_mes.strip()]
-        df_view = df_view.drop(columns=["_fecha_dt", "_mes"], errors="ignore")
+    if filt_mes != "Todos":
+        df_view["_mes_calc"] = pd.to_datetime(df_view["fecha_factura"], errors="coerce").dt.to_period("M").astype(str)
+        df_view = df_view[df_view["_mes_calc"] == filt_mes]
+        df_view = df_view.drop(columns=["_mes_calc"], errors="ignore")
     if filt_nombre.strip():
         df_view = df_view[df_view[COL_NOMBRE].str.lower().str.contains(filt_nombre.lower(), na=False)]
 
@@ -955,7 +1169,7 @@ elif pagina == "👤 Clientes":
     st.caption(f"Total: {len(df_view)} clientes")
 
     st.markdown("---")
-    tab_edit, tab_alta, tab_baja = st.tabs(["✏️ Editar Cliente", "➕ Alta de Cliente", "🚫 Dar de Baja"])
+    tab_edit, tab_alta, tab_baja, tab_docs = st.tabs(["✏️ Editar Cliente", "➕ Alta de Cliente", "🚫 Dar de Baja", "📂 Documentos"])
 
     # ── Editar ──
     with tab_edit:
@@ -987,50 +1201,83 @@ elif pagina == "👤 Clientes":
     # ── Alta ──
     with tab_alta:
         st.subheader("Registrar Nuevo Cliente")
-        # Generar ID automático
-        ids_nums = df_c[COL_ID_CLIENTE].str.extract(r"(\d+)$")[0].dropna()
-        ids_nums = pd.to_numeric(ids_nums, errors="coerce").dropna()
-        nuevo_id = f"TCS-FTTH-{int(ids_nums.max()) + 1:06d}" if not ids_nums.empty else "TCS-FTTH-000001"
 
-        st.info(f"ID asignado automáticamente: **{nuevo_id}**")
+        # Tipo de Red y ID automático
+        ac_r1, ac_r2 = st.columns(2)
+        a_tipo_red = ac_r1.selectbox("Tipo de Red *", ["FTTH", "Inalambrico", "TerraNetwork", "Empresarial"])
+        
+        # Generar ID según tipo de red
+        prefijo_red = {"FTTH": "TCS-FTTH", "Inalambrico": "TCS-INAL", "TerraNetwork": "TRN", "Empresarial": "TCS-EMP"}
+        prefijo = prefijo_red[a_tipo_red]
+        ids_tipo = df_c[df_c[COL_ID_CLIENTE].str.startswith(prefijo)][COL_ID_CLIENTE]
+        ids_nums = ids_tipo.str.extract(r"(\d+)$")[0].dropna()
+        ids_nums = pd.to_numeric(ids_nums, errors="coerce").dropna()
+        nuevo_id = f"{prefijo}-{int(ids_nums.max()) + 1:06d}" if not ids_nums.empty else f"{prefijo}-000001"
+        ac_r2.info(f"ID: **{nuevo_id}**")
 
         ac1, ac2 = st.columns(2)
         a_nombre   = ac1.text_input("Nombre Completo *")
         a_cedula   = ac2.text_input("Número de Cédula")
         ac3, ac4 = st.columns(2)
-        a_monto    = ac3.text_input("Monto Mensual (sin ₡, ej: 21000) *")
-        a_vendedor = ac4.text_input("Vendedor")
+        montos_comunes = ["21000", "24500", "19000", "20000", "25000", "27000", "27500", "29000", "30000", "35000", "37500", "40000", "59000", "Otro"]
+        a_monto_sel = ac3.selectbox("Monto Mensual (₡) *", montos_comunes)
+        if a_monto_sel == "Otro":
+            a_monto = ac4.text_input("Monto personalizado (₡)")
+        else:
+            a_monto = a_monto_sel
+            ac4.info(f"Monto: **₡{int(a_monto_sel):,}**".replace(",", "."))
         ac5, ac6 = st.columns(2)
-        a_tel      = ac5.text_input("Teléfono")
-        a_celular  = ac6.text_input("Celular")
+        megas_opciones = ["200", "100", "50", "500", "25", "30", "21", "23", "Otro"]
+        a_megas = ac5.selectbox("Megas", megas_opciones)
+        if a_megas == "Otro":
+            a_megas = ac6.text_input("Megas personalizado")
+        else:
+            a_tv = ac6.selectbox("TV", ["0", "1", "2"])
+        ac7, ac8 = st.columns(2)
+        vendedores = sorted(set(df_c[COL_VENDEDOR].unique()) - {""})
+        vendedores = vendedores + ["Otro"]
+        a_vendedor = ac7.selectbox("Vendedor", [""] + vendedores)
+        if a_vendedor == "Otro":
+            a_vendedor = ac8.text_input("Nombre del vendedor")
+        nodos = sorted(set(df_c[COL_NODO].unique()) - {""})
+        a_nodo = ac8.selectbox("Nodo", [""] + nodos) if a_vendedor != "Otro" else ""
+        ac9, ac10 = st.columns(2)
+        a_tel      = ac9.text_input("Teléfono")
+        a_celular  = ac10.text_input("Celular")
+        a_correo   = st.text_input("Correo electrónico")
         a_dir      = st.text_area("Dirección")
-        a_fecha_contrato    = st.date_input("Fecha Contrato", value=date.today())
-        a_fecha_instalacion = st.date_input("Fecha Instalación", value=date.today())
-        a_fecha_primer_fact = st.date_input("Fecha Primer Factura", value=date.today())
+        ac_f1, ac_f2, ac_f3 = st.columns(3)
+        a_fecha_contrato    = ac_f1.date_input("Fecha Contrato", value=date.today())
+        a_fecha_instalacion = ac_f2.date_input("Fecha Instalación", value=date.today())
+        a_fecha_primer_fact = ac_f3.date_input("Fecha Primer Factura", value=date.today())
 
         if st.button("➕ Registrar Cliente", type="primary"):
             if not a_nombre.strip():
                 st.error("El Nombre es obligatorio.")
-            elif not a_monto.strip() or parse_monto(a_monto) <= 0:
+            elif not a_monto or parse_monto(a_monto) <= 0:
                 st.error("El Monto debe ser un número válido mayor a 0.")
             else:
                 nueva_fila = {col: "" for col in df_c.columns}
                 nueva_fila[COL_ID_CLIENTE]   = nuevo_id
                 nueva_fila[COL_NOMBRE]       = a_nombre.strip()
                 nueva_fila[COL_CEDULA]       = a_cedula.strip()
-                nueva_fila[COL_MONTO]        = a_monto.strip()
-                nueva_fila[COL_VENDEDOR]     = a_vendedor.strip()
+                nueva_fila[COL_MONTO]        = str(int(parse_monto(a_monto)))
+                nueva_fila[COL_VENDEDOR]     = a_vendedor.strip() if a_vendedor else ""
                 nueva_fila[COL_TELEFONO]     = a_tel.strip()
                 nueva_fila[COL_CELULAR]      = a_celular.strip()
+                nueva_fila[COL_CORREO]       = a_correo.strip()
+                nueva_fila[COL_MEGAS]        = a_megas if a_megas != "Otro" else a_megas
+                nueva_fila[COL_TV]           = a_tv if 'a_tv' in dir() else "0"
                 nueva_fila["Dirrecion"]      = a_dir.strip()
                 nueva_fila["Fecha Contrato"]     = str(a_fecha_contrato)
                 nueva_fila["Fecha Instalacion"]  = str(a_fecha_instalacion)
                 nueva_fila[COL_FECHA_1FAC]       = str(a_fecha_primer_fact)
                 nueva_fila[COL_ESTADO]       = "Activo"
-                nueva_fila["Tipo de Red"]    = "FTTH"
+                nueva_fila["Tipo de Red"]    = a_tipo_red
+                nueva_fila[COL_NODO]         = a_nodo if 'a_nodo' in dir() else ""
                 df_c = pd.concat([df_c, pd.DataFrame([nueva_fila])], ignore_index=True)
                 save_clientes(df_c)
-                st.success(f"✅ Cliente {nuevo_id} – {a_nombre} registrado.")
+                st.success(f"✅ Cliente {nuevo_id} – {a_nombre} registrado como {a_tipo_red}.")
                 st.rerun()
 
     # ── Baja ──
@@ -1046,7 +1293,7 @@ elif pagina == "👤 Clientes":
             ).tolist()
             baja_sel = st.selectbox("Cliente Activo", baja_opciones, key="baja_sel")
             baja_id  = baja_sel.split(" – ")[0].strip()
-            motivo   = st.selectbox("Motivo", ["DX - No Pago", "DX - Al Dia", "DX", "DX - Cortesia"])
+            motivo   = st.selectbox("Motivo", ["DX - No Pago", "DX - Al Dia", "DX - Cortesia", "DX - Cambio Proveedor", "DX - Mudanza", "DX - Problemas Técnicos", "DX - Otro"])
             fecha_desc = st.date_input("Fecha Desconexión", value=date.today())
 
             if st.button("🚫 Confirmar Baja", type="primary"):
@@ -1056,6 +1303,65 @@ elif pagina == "👤 Clientes":
                 save_clientes(df_c)
                 st.success(f"✅ Cliente {baja_id} dado de baja con estado '{motivo}'.")
                 st.rerun()
+
+    # ── Documentos ──
+    with tab_docs:
+        st.subheader("📂 Documentos del Cliente")
+
+        opciones_docs = df_c.apply(
+            lambda r: f"{r[COL_ID_CLIENTE]} – {r[COL_NOMBRE]}", axis=1
+        ).tolist()
+        sel_docs = st.selectbox("Seleccionar Cliente", opciones_docs, key="docs_sel")
+        doc_cid = sel_docs.split(" – ")[0].strip()
+        doc_row = df_c[df_c[COL_ID_CLIENTE] == doc_cid].iloc[0]
+        doc_nombre = doc_row[COL_NOMBRE]
+        doc_tipo_red = doc_row.get("Tipo de Red", "FTTH")
+
+        st.write(f"**{doc_cid}** — {doc_nombre} ({doc_tipo_red})")
+
+        tipo_doc = st.selectbox("Tipo de Documento", [
+            "Contrato firmado",
+            "Comprobante de pago",
+            "Cédula / Identificación",
+            "Foto de instalación",
+            "Otro documento",
+        ], key="tipo_doc_sel")
+
+        # Mapear tipo a subcarpeta
+        subcarpeta_map = {
+            "Contrato firmado": "contratos",
+            "Comprobante de pago": "comprobantes",
+            "Cédula / Identificación": "documentos",
+            "Foto de instalación": "documentos",
+            "Otro documento": "documentos",
+        }
+
+        archivo = st.file_uploader(
+            "Subir archivo (PDF, imagen JPG/PNG)",
+            type=["pdf", "jpg", "jpeg", "png"],
+            key="doc_uploader",
+        )
+
+        if archivo and st.button("☁️ Subir a Google Drive", type="primary", key="btn_upload_doc"):
+            with st.spinner("Creando carpeta y subiendo archivo..."):
+                folders = drive_get_client_folder(doc_cid, doc_nombre, doc_tipo_red)
+                if folders is None:
+                    st.error("No se pudo conectar a Google Drive. Verificá que la cuenta de servicio tenga acceso.")
+                else:
+                    target_folder = folders[subcarpeta_map[tipo_doc]]
+                    # Nombre del archivo: tipo_fecha_original
+                    fecha_str = datetime.now().strftime("%Y%m%d")
+                    ext = archivo.name.split(".")[-1]
+                    nuevo_nombre = f"{tipo_doc.replace(' ', '_').replace('/', '_')}_{fecha_str}.{ext}"
+                    
+                    result = drive_upload_file(archivo.read(), nuevo_nombre, target_folder)
+                    if result:
+                        link = result.get("webViewLink", "")
+                        st.success(f"✅ Archivo subido: **{nuevo_nombre}**")
+                        if link:
+                            st.markdown(f"[📄 Ver en Drive]({link})")
+                    else:
+                        st.error("Error al subir el archivo.")
 
 
 # ═════════════════════════════════════════════
@@ -1071,15 +1377,14 @@ elif pagina == "💰 Pagos":
     else:
         # Filtro por mes y cliente
         pm1, pm2 = st.columns(2)
-        filt_mes_p = pm1.text_input("Filtrar por mes (YYYY-MM)", placeholder="2026-03")
+        meses_pago = sorted(df_p["mes_facturado"].dropna().unique().tolist(), reverse=True)
+        meses_pago = [m for m in meses_pago if m and m != "" and m != "nan"]
+        filt_mes_p = pm1.selectbox("Filtrar por mes", ["Todos"] + meses_pago, key="filt_mes_pagos")
         filt_cli_p = pm2.text_input("Buscar por cliente")
 
         df_pv = df_p.copy()
-        if filt_mes_p.strip():
-            df_pv["_fecha_dt"] = pd.to_datetime(df_pv["fecha_pago"], errors="coerce")
-            df_pv["_mes"] = df_pv["_fecha_dt"].dt.to_period("M").astype(str)
-            df_pv = df_pv[df_pv["_mes"] == filt_mes_p.strip()]
-            df_pv = df_pv.drop(columns=["_fecha_dt", "_mes"], errors="ignore")
+        if filt_mes_p != "Todos":
+            df_pv = df_pv[df_pv["mes_facturado"] == filt_mes_p]
         if filt_cli_p.strip():
             df_pv = df_pv[df_pv["nombre_cliente"].str.lower().str.contains(filt_cli_p.lower(), na=False)]
 

@@ -886,41 +886,55 @@ Departamento de Cobros – Telcosur CR"""
     st.markdown("---")
 
     # ── Mora ──
-    st.subheader("🔴 Mora – Clientes con Facturas Pendientes")
+    st.subheader("🔴 Mora – Clientes con Facturas Vencidas")
 
-    df_pendientes = df_f[df_f["estado_factura"].str.lower() == "pendiente"].copy()
-    df_pendientes["monto_num"] = df_pendientes[COL_MONTO].apply(parse_monto)
+    df_mora = df_f[df_f["estado_factura"].isin(["Vencida", "En Cobro"])].copy()
+    df_mora["monto_num"] = df_mora[COL_MONTO].apply(parse_monto)
+    df_mora["_fecha_dt"] = pd.to_datetime(df_mora["fecha_factura"], errors="coerce")
+    df_mora["dias_sin_pago"] = (pd.Timestamp.now().normalize() - df_mora["_fecha_dt"]).dt.days
+
     mora = (
-        df_pendientes.groupby(["cliente_id", COL_NOMBRE])
-        .agg(facturas_pendientes=("factura_id", "count"),
-             monto_total=("monto_num", "sum"))
+        df_mora.groupby(["cliente_id", COL_NOMBRE])
+        .agg(
+            facturas_vencidas=("factura_id", "count"),
+            monto_total=("monto_num", "sum"),
+            dias_max=("dias_sin_pago", "max"),
+            en_cobro=("estado_factura", lambda x: (x == "En Cobro").sum()),
+            vencidas=("estado_factura", lambda x: (x == "Vencida").sum()),
+        )
         .reset_index()
-        .sort_values("monto_total", ascending=False)
+        .sort_values("dias_max", ascending=False)
     )
 
     if not mora.empty:
-        mora["monto_total_fmt"] = mora["monto_total"].apply(fmt_colones)
+        mora["monto_fmt"] = mora["monto_total"].apply(fmt_colones)
+        mora["alerta"] = mora.apply(
+            lambda r: "🔴 VENCIDA" if r["vencidas"] > 0 else "🟡 EN COBRO", axis=1
+        )
         mora_display = (
-            mora[["cliente_id", COL_NOMBRE, "facturas_pendientes", "monto_total_fmt"]]
+            mora[["cliente_id", COL_NOMBRE, "en_cobro", "vencidas", "monto_fmt", "dias_max", "alerta"]]
             .rename(columns={
                 "cliente_id": "ID",
                 COL_NOMBRE: "Cliente",
-                "facturas_pendientes": "Fact. Pendientes",
-                "monto_total_fmt": "Monto Total",
+                "en_cobro": "En Cobro",
+                "vencidas": "Vencidas",
+                "monto_fmt": "Monto Total",
+                "dias_max": "Días sin Pago",
+                "alerta": "Estado",
             })
             .reset_index(drop=True)
         )
 
         def highlight_mora(row):
-            n = row["Fact. Pendientes"]
-            color = "background-color:#7f1d1d; color:white" if int(n) > 1 else ""
-            return [color] * len(row)
+            if row["Vencidas"] > 0:
+                return ["background-color:#7f1d1d; color:white"] * len(row)
+            return [""] * len(row)
 
         st.dataframe(
             mora_display.style.apply(highlight_mora, axis=1),
             use_container_width=True, hide_index=True,
         )
-        st.caption("🔴 Rojo = debe más de 1 factura")
+        st.caption("🔴 Rojo = tiene facturas vencidas (+7 días) | 🟡 = en período de cobro (≤7 días)")
     else:
         st.success("¡Sin clientes en mora!")
 
@@ -1317,35 +1331,105 @@ elif pagina == "👤 Clientes":
             sel_det = st.selectbox("Seleccionar cliente", opciones_det, key="detalle_sel")
             det_id = sel_det.split(" – ")[0].strip()
             det_row = df_c[df_c[COL_ID_CLIENTE] == det_id].iloc[0]
+
+            # ── Info personal ──
+            st.markdown("#### 👤 Información Personal")
             d1, d2 = st.columns(2)
             d1.markdown(f"""
-            **ID:** {det_row.get(COL_ID_CLIENTE, '')}  
-            **Nombre:** {det_row.get(COL_NOMBRE, '')}  
-            **Cédula:** {det_row.get(COL_CEDULA, '')}  
-            **Teléfono:** {det_row.get(COL_TELEFONO, '')}  
-            **Celular:** {det_row.get(COL_CELULAR, '')}  
-            **Correo:** {det_row.get(COL_CORREO, '')}  
-            **Dirección:** {det_row.get('Dirrecion', '')}
+**ID:** {det_row.get(COL_ID_CLIENTE, '')}  
+**Nombre:** {det_row.get(COL_NOMBRE, '')}  
+**Cédula:** {det_row.get(COL_CEDULA, '')}  
+**Fecha Nacimiento:** {det_row.get('Fecha de nacimiento', '')}  
+**Teléfono:** {det_row.get(COL_TELEFONO, '')}  
+**Celular:** {det_row.get(COL_CELULAR, '')}  
+**Correo:** {det_row.get(COL_CORREO, '')}  
+**Dirección:** {det_row.get('Dirrecion', '')}
             """)
             d2.markdown(f"""
-            **Tipo de Red:** {det_row.get('Tipo de Red', '')}  
-            **Megas:** {det_row.get(COL_MEGAS, '')} Mbps  
-            **TV:** {det_row.get(COL_TV, '')}  
-            **Monto Mensual:** ₡{det_row.get(COL_MONTO, '')}  
-            **Estado:** {det_row.get(COL_ESTADO, '')}  
-            **Vendedor:** {det_row.get(COL_VENDEDOR, '')}  
-            **Nodo:** {det_row.get(COL_NODO, '')}
+**Tipo de Red:** {det_row.get('Tipo de Red', '')}  
+**Megas:** {det_row.get(COL_MEGAS, '')} Mbps  
+**TV:** {det_row.get(COL_TV, '')}  
+**Promo:** {det_row.get('Promo', '')}  
+**Monto Mensual:** ₡{det_row.get(COL_MONTO, '')}  
+**Estado:** {det_row.get(COL_ESTADO, '')}  
+**Vendedor:** {det_row.get(COL_VENDEDOR, '')}  
+**Nodo:** {det_row.get(COL_NODO, '')}
             """)
+
+            # ── Info de equipo ──
+            st.markdown("#### 📡 Equipo e Infraestructura")
+            e1, e2 = st.columns(2)
+            e1.markdown(f"""
+**Número de Ufinet:** {det_row.get('Numero de Ufinet', '')}  
+**Medidor:** {det_row.get('Medidor', '')}  
+**SN (Serie):** {det_row.get('SN', '')}  
+**Marca ONU:** {det_row.get('Marca', '')}  
+**Modelo:** {det_row.get('Modelo', '')}
+            """)
+            e2.markdown(f"""
+**MAC:** {det_row.get('MAC', '')}  
+**IP:** {det_row.get('IP', '')}  
+**Postes:** {det_row.get('Postes', '')}
+            """)
+
+            # ── Fechas ──
+            st.markdown("#### 📅 Fechas")
             d3, d4 = st.columns(2)
             d3.markdown(f"""
-            **Fecha Contrato:** {det_row.get('Fecha Contrato', '')}  
-            **Fecha Instalación:** {det_row.get('Fecha Instalacion', '')}  
-            **Fecha 1ra Factura:** {det_row.get(COL_FECHA_1FAC, '')}
+**Fecha Contrato:** {det_row.get('Fecha Contrato', '')}  
+**Fecha Instalación:** {det_row.get('Fecha Instalacion', '')}  
+**Fecha 1ra Factura:** {det_row.get(COL_FECHA_1FAC, '')}
             """)
             d4.markdown(f"""
-            **Fecha Desconexión:** {det_row.get(COL_FECHA_DX, '')}  
-            **Notas:** {det_row.get(COL_NOTAS, '')}
+**Fecha Desconexión:** {det_row.get(COL_FECHA_DX, '')}  
+**Notas:** {det_row.get(COL_NOTAS, '')}
             """)
+
+            # ── Historial de Facturas ──
+            st.markdown("#### 🧾 Historial de Facturas")
+            df_f_det = load_facturas()
+            fac_cliente = df_f_det[df_f_det["cliente_id"] == det_id].copy()
+            if fac_cliente.empty:
+                st.info("Sin facturas registradas.")
+            else:
+                fac_cliente["monto_fmt"] = fac_cliente[COL_MONTO].apply(lambda x: fmt_colones(parse_monto(x)))
+                color_map = {"Pagada": "🟢", "En Cobro": "🔵", "Vencida": "🔴", "Anulada": "⚫"}
+                fac_cliente["🔘"] = fac_cliente["estado_factura"].map(lambda x: color_map.get(x, "⚪"))
+                cols_fac_det = ["🔘", "factura_id", "fecha_factura", "estado_factura", "monto_fmt"]
+                cols_fac_det = [c for c in cols_fac_det if c in fac_cliente.columns]
+                st.dataframe(
+                    fac_cliente[cols_fac_det].rename(columns={
+                        "factura_id": "ID Factura", "fecha_factura": "Fecha",
+                        "estado_factura": "Estado", "monto_fmt": "Monto",
+                    }).sort_values("Fecha", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
+                # Resumen
+                n_pagadas = len(fac_cliente[fac_cliente["estado_factura"] == "Pagada"])
+                n_cobro = len(fac_cliente[fac_cliente["estado_factura"] == "En Cobro"])
+                n_vencidas = len(fac_cliente[fac_cliente["estado_factura"] == "Vencida"])
+                st.caption(f"Total: {len(fac_cliente)} facturas | 🟢 {n_pagadas} pagadas | 🔵 {n_cobro} en cobro | 🔴 {n_vencidas} vencidas")
+
+            # ── Historial de Pagos ──
+            st.markdown("#### 💰 Historial de Pagos")
+            df_p_det = load_pagos()
+            pag_cliente = df_p_det[df_p_det["cliente_id"] == det_id].copy()
+            if pag_cliente.empty:
+                st.info("Sin pagos registrados.")
+            else:
+                pag_cliente["monto_fmt"] = pag_cliente["monto"].apply(lambda x: fmt_colones(parse_monto(x)))
+                cols_pag_det = ["pago_id", "fecha_pago", "mes_facturado", "monto_fmt", "numero_pago_cliente"]
+                cols_pag_det = [c for c in cols_pag_det if c in pag_cliente.columns]
+                st.dataframe(
+                    pag_cliente[cols_pag_det].rename(columns={
+                        "pago_id": "ID Pago", "fecha_pago": "Fecha Pago",
+                        "mes_facturado": "Mes", "monto_fmt": "Monto",
+                        "numero_pago_cliente": "Comprobante",
+                    }).sort_values("Fecha Pago", ascending=False),
+                    use_container_width=True, hide_index=True,
+                )
+                total_pagado = pag_cliente["monto"].apply(parse_monto).sum()
+                st.caption(f"Total pagado: {fmt_colones(total_pagado)} en {len(pag_cliente)} pagos")
 
     st.markdown("---")
     tab_edit, tab_alta, tab_baja, tab_docs = st.tabs(["✏️ Editar Cliente", "➕ Alta de Cliente", "🚫 Dar de Baja", "📂 Documentos"])

@@ -598,14 +598,14 @@ if pagina == "📊 Dashboard":
 
     total_proyectado = activos[COL_MONTO].apply(parse_monto).sum()
     total_cobrado    = df_p["monto"].apply(parse_monto).sum() if (not df_p.empty and "monto" in df_p.columns) else 0.0
-    pendientes_total = df_f[df_f["estado_factura"].str.lower() == "pendiente"][COL_MONTO].apply(parse_monto).sum()
+    total_en_mora    = df_f[df_f["estado_factura"].isin(["En Cobro", "Vencida"])][COL_MONTO].apply(parse_monto).sum()
     perdida_bajas    = inactivos[COL_MONTO].apply(parse_monto).sum()
 
     c1, c2, c3, c4 = st.columns(4)
     for col, label, val, color in [
         (c1, "Clientes Activos",       str(len(activos)),           "#38bdf8"),
         (c2, "Ingreso Proyectado/mes", fmt_colones(total_proyectado), "#4ade80"),
-        (c3, "Total Pendiente",        fmt_colones(pendientes_total), "#fb923c"),
+        (c3, "Total en Mora",          fmt_colones(total_en_mora),    "#fb923c"),
         (c4, "Pérdida por Bajas/mes",  fmt_colones(perdida_bajas),    "#f87171"),
     ]:
         col.markdown(f"""

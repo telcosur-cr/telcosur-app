@@ -1273,19 +1273,26 @@ elif pagina == "📄 Facturas":
 
                 # Subir comprobante al Drive si se adjuntó
                 if archivo_comprobante is not None:
-                    tipo_red = str(row.get("Estado", "FTTH"))
-                    # Buscar tipo de red del cliente
-                    df_cli_temp = load_clientes()
-                    cli_match = df_cli_temp[df_cli_temp[COL_ID_CLIENTE] == str(row["cliente_id"])]
-                    tipo_red_cli = cli_match.iloc[0].get("Tipo de Red", "FTTH") if not cli_match.empty else "FTTH"
-                    
-                    folders = drive_get_client_folder(str(row["cliente_id"]), str(row[COL_NOMBRE]), tipo_red_cli)
-                    if folders and folders.get("comprobantes"):
-                        ext = archivo_comprobante.name.split(".")[-1]
-                        nombre_archivo = f"Comprobante_{mes_facturado}_{num_pago_cliente.strip()[:20]}.{ext}"
-                        result = drive_upload_file(archivo_comprobante.read(), nombre_archivo, folders["comprobantes"])
-                        if result:
-                            st.success(f"📎 Comprobante subido a Drive: {nombre_archivo}")
+                    try:
+                        # Buscar tipo de red del cliente
+                        df_cli_temp = load_clientes()
+                        cli_match = df_cli_temp[df_cli_temp[COL_ID_CLIENTE] == str(row["cliente_id"])]
+                        tipo_red_cli = cli_match.iloc[0].get("Tipo de Red", "FTTH") if not cli_match.empty else "FTTH"
+                        
+                        folders = drive_get_client_folder(str(row["cliente_id"]), str(row[COL_NOMBRE]), tipo_red_cli)
+                        if folders and folders.get("comprobantes"):
+                            ext = archivo_comprobante.name.split(".")[-1]
+                            nombre_archivo = f"Comprobante_{mes_facturado}_{num_pago_cliente.strip()[:20]}.{ext}"
+                            file_bytes = archivo_comprobante.read()
+                            result = drive_upload_file(file_bytes, nombre_archivo, folders["comprobantes"])
+                            if result:
+                                st.success(f"📎 Comprobante subido a Drive: {nombre_archivo}")
+                            else:
+                                st.warning("⚠️ No se pudo subir el comprobante al Drive.")
+                        else:
+                            st.warning("⚠️ No se pudo crear la carpeta en Drive. Verificá permisos de la cuenta de servicio.")
+                    except Exception as e:
+                        st.warning(f"⚠️ Error al subir comprobante: {e}")
 
             save_facturas(df_f)
             st.success(f"✅ Factura {fac_id_sel} actualizada a '{nuevo_estado}'.")
@@ -1847,68 +1854,98 @@ elif pagina == "💰 Pagos":
         # ── Editar / Anular Pagos ──
         st.subheader("✏️ Editar o Anular Pago")
 
-        tab_editar_pago, tab_anular_pago = st.tabs(["✏️ Editar Pago", "🗑️ Anular Pago"])
+        # Filtros comunes para encontrar pagos
+        fp1, fp2, fp3 = st.columns(3)
+        buscar_pago_cli = fp1.text_input("Buscar por cliente", key="buscar_pago_edit")
+        meses_pago_edit = sorted(df_p["mes_facturado"].dropna().unique().tolist(), reverse=True)
+        meses_pago_edit = [m for m in meses_pago_edit if m and m != "" and m != "nan"]
+        buscar_pago_mes = fp2.selectbox("Filtrar por mes", ["Todos"] + meses_pago_edit, key="buscar_pago_mes_edit")
+        buscar_pago_id = fp3.text_input("Buscar por ID pago o comprobante", key="buscar_pago_id_edit")
 
-        with tab_editar_pago:
-            opciones_edit = df_p.apply(
-                lambda r: f"{r['pago_id']} | {r['nombre_cliente']} | {r['mes_facturado']} | {fmt_colones(parse_monto(r['monto']))}",
-                axis=1
-            ).tolist()
-            sel_edit = st.selectbox("Seleccionar Pago a Editar", opciones_edit, key="edit_pago_sel")
-            edit_pago_id = sel_edit.split(" | ")[0].strip()
-            idx_edit = df_p.index[df_p["pago_id"] == edit_pago_id][0]
-            row_edit = df_p.loc[idx_edit]
-
-            ep1, ep2 = st.columns(2)
-            edit_monto = ep1.text_input("Monto (₡)", value=row_edit.get("monto", ""), key="edit_monto")
-            edit_fecha = ep2.text_input("Fecha de Pago", value=row_edit.get("fecha_pago", ""), key="edit_fecha")
-            ep3, ep4 = st.columns(2)
-            edit_comprobante = ep3.text_input("# Comprobante Cliente",
-                                              value=row_edit.get("numero_pago_cliente", ""), key="edit_comp")
-            edit_mes = ep4.text_input("Mes Facturado", value=row_edit.get("mes_facturado", ""), key="edit_mes")
-
-            if st.button("💾 Guardar Cambios del Pago", key="btn_save_edit_pago"):
-                df_p.at[idx_edit, "monto"] = str(int(parse_monto(edit_monto))) if parse_monto(edit_monto) > 0 else edit_monto.strip()
-                df_p.at[idx_edit, "fecha_pago"] = edit_fecha.strip()
-                df_p.at[idx_edit, "numero_pago_cliente"] = edit_comprobante.strip()
-                df_p.at[idx_edit, "mes_facturado"] = edit_mes.strip()
-                save_pagos(df_p)
-                st.success(f"✅ Pago {edit_pago_id} actualizado.")
-                st.rerun()
-
-        with tab_anular_pago:
-            st.warning("⚠️ Al anular un pago, la factura asociada vuelve a estado **Pendiente**.")
-            opciones_anular = df_p.apply(
-                lambda r: f"{r['pago_id']} | {r['nombre_cliente']} | {r['mes_facturado']} | {fmt_colones(parse_monto(r['monto']))}",
-                axis=1
-            ).tolist()
-            sel_anular = st.selectbox("Seleccionar Pago a Anular", opciones_anular, key="anular_pago_sel")
-            anular_pago_id = sel_anular.split(" | ")[0].strip()
-            row_anular = df_p[df_p["pago_id"] == anular_pago_id].iloc[0]
-
-            st.write(
-                f"**Cliente:** {row_anular['nombre_cliente']} &nbsp;|&nbsp; "
-                f"**Factura:** {row_anular['factura_id']} &nbsp;|&nbsp; "
-                f"**Monto:** {fmt_colones(parse_monto(row_anular['monto']))} &nbsp;|&nbsp; "
-                f"**Mes:** {row_anular['mes_facturado']}"
+        df_p_filtrado = df_p.copy()
+        if buscar_pago_cli.strip():
+            df_p_filtrado = df_p_filtrado[df_p_filtrado["nombre_cliente"].str.lower().str.contains(buscar_pago_cli.lower(), na=False)]
+        if buscar_pago_mes != "Todos":
+            df_p_filtrado = df_p_filtrado[df_p_filtrado["mes_facturado"] == buscar_pago_mes]
+        if buscar_pago_id.strip():
+            mask_id = (
+                df_p_filtrado["pago_id"].str.contains(buscar_pago_id, case=False, na=False) |
+                df_p_filtrado["numero_pago_cliente"].str.contains(buscar_pago_id, case=False, na=False)
             )
+            df_p_filtrado = df_p_filtrado[mask_id]
 
-            confirmar = st.checkbox("Confirmo que deseo anular este pago", key="confirmar_anular")
-            if st.button("🗑️ Anular Pago", type="primary", key="btn_anular_pago"):
-                if not confirmar:
-                    st.error("Debés confirmar marcando la casilla antes de anular.")
-                else:
-                    # Revertir factura a Pendiente
-                    df_f = load_facturas()
-                    fac_id_anular = row_anular["factura_id"]
-                    mask_fac = df_f["factura_id"] == fac_id_anular
-                    if mask_fac.any():
-                        df_f.loc[mask_fac, "estado_factura"] = "Pendiente"
-                        save_facturas(df_f)
+        if df_p_filtrado.empty:
+            st.info("No se encontraron pagos con esos filtros.")
+        else:
+            st.caption(f"Mostrando {len(df_p_filtrado)} de {len(df_p)} pagos")
 
-                    # Eliminar el pago
-                    df_p = df_p[df_p["pago_id"] != anular_pago_id].reset_index(drop=True)
+            tab_editar_pago, tab_anular_pago = st.tabs(["✏️ Editar Pago", "🗑️ Anular Pago"])
+
+            with tab_editar_pago:
+                opciones_edit = df_p_filtrado.apply(
+                    lambda r: f"{r['pago_id']} | {r['nombre_cliente']} | {r['mes_facturado']} | {fmt_colones(parse_monto(r['monto']))}",
+                    axis=1
+                ).tolist()
+                sel_edit = st.selectbox("Seleccionar Pago a Editar", opciones_edit, key="edit_pago_sel")
+                edit_pago_id = sel_edit.split(" | ")[0].strip()
+                idx_edit = df_p.index[df_p["pago_id"] == edit_pago_id][0]
+                row_edit = df_p.loc[idx_edit]
+
+                ep1, ep2 = st.columns(2)
+                edit_monto = ep1.text_input("Monto (₡)", value=row_edit.get("monto", ""), key="edit_monto")
+                edit_fecha = ep2.date_input("Fecha de Pago",
+                    value=pd.to_datetime(row_edit.get("fecha_pago", ""), errors="coerce") or date.today(),
+                    key="edit_fecha")
+                ep3, ep4 = st.columns(2)
+                edit_comprobante = ep3.text_input("# Comprobante Cliente",
+                                                  value=row_edit.get("numero_pago_cliente", ""), key="edit_comp")
+                meses_edit_sel = sorted(df_p["mes_facturado"].dropna().unique().tolist())
+                meses_edit_sel = [m for m in meses_edit_sel if m and m != "nan"]
+                mes_actual_idx = meses_edit_sel.index(row_edit.get("mes_facturado", "")) if row_edit.get("mes_facturado", "") in meses_edit_sel else 0
+                edit_mes = ep4.selectbox("Mes Facturado", meses_edit_sel, index=mes_actual_idx, key="edit_mes")
+
+                if st.button("💾 Guardar Cambios del Pago", key="btn_save_edit_pago"):
+                    df_p.at[idx_edit, "monto"] = str(int(parse_monto(edit_monto))) if parse_monto(edit_monto) > 0 else edit_monto.strip()
+                    df_p.at[idx_edit, "fecha_pago"] = str(edit_fecha)
+                    df_p.at[idx_edit, "numero_pago_cliente"] = edit_comprobante.strip()
+                    df_p.at[idx_edit, "mes_facturado"] = edit_mes
                     save_pagos(df_p)
+                    st.success(f"✅ Pago {edit_pago_id} actualizado.")
+                    st.rerun()
 
-                    st.success(f"✅ Pago {anular_pago_id} anulado. Factura {fac_id_anular} revertida a Pendiente.")
+            with tab_anular_pago:
+                st.warning("⚠️ Al anular un pago, la factura asociada vuelve a estado **En Cobro**.")
+                opciones_anular = df_p_filtrado.apply(
+                    lambda r: f"{r['pago_id']} | {r['nombre_cliente']} | {r['mes_facturado']} | {fmt_colones(parse_monto(r['monto']))}",
+                    axis=1
+                ).tolist()
+                sel_anular = st.selectbox("Seleccionar Pago a Anular", opciones_anular, key="anular_pago_sel")
+                anular_pago_id = sel_anular.split(" | ")[0].strip()
+                row_anular = df_p[df_p["pago_id"] == anular_pago_id].iloc[0]
+
+                st.write(
+                    f"**Cliente:** {row_anular['nombre_cliente']} &nbsp;|&nbsp; "
+                    f"**Factura:** {row_anular['factura_id']} &nbsp;|&nbsp; "
+                    f"**Monto:** {fmt_colones(parse_monto(row_anular['monto']))} &nbsp;|&nbsp; "
+                    f"**Mes:** {row_anular['mes_facturado']}"
+                )
+
+                confirmar = st.checkbox("Confirmo que deseo anular este pago", key="confirmar_anular")
+                if st.button("🗑️ Anular Pago", type="primary", key="btn_anular_pago"):
+                    if not confirmar:
+                        st.error("Debés confirmar marcando la casilla antes de anular.")
+                    else:
+                        # Revertir factura a Pendiente (se recalculará a En Cobro/Vencida)
+                        df_f = load_facturas()
+                        fac_id_anular = row_anular["factura_id"]
+                        mask_fac = df_f["factura_id"] == fac_id_anular
+                        if mask_fac.any():
+                            df_f.loc[mask_fac, "estado_factura"] = "Pendiente"
+                            save_facturas(df_f)
+
+                        # Eliminar el pago
+                        df_p = df_p[df_p["pago_id"] != anular_pago_id].reset_index(drop=True)
+                        save_pagos(df_p)
+
+                        st.success(f"✅ Pago {anular_pago_id} anulado. Factura {fac_id_anular} revertida.")
                     st.rerun()

@@ -214,6 +214,25 @@ def drive_upload_file(file_data, filename, folder_id, mime_type=None):
         st.error(f"Error subiendo archivo: {e}")
         return None
 
+
+def drive_list_files(folder_id):
+    """Lista archivos en una carpeta de Drive. Retorna lista de dicts con name, id, webViewLink, mimeType."""
+    service = _get_drive_service()
+    if service is None:
+        return []
+    try:
+        results = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'",
+            fields="files(id,name,webViewLink,mimeType,createdTime,size)",
+            pageSize=50,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            orderBy="createdTime desc",
+        ).execute()
+        return results.get("files", [])
+    except Exception:
+        return []
+
 # Constantes de columnas (nombres limpios, sin espacios trailing)
 COL_ID_CLIENTE = "ID Cliente"
 COL_NOMBRE     = "Nombre del cliente"
@@ -1438,6 +1457,30 @@ elif pagina == "👤 Clientes":
                 )
                 total_pagado = pag_cliente["monto"].apply(parse_monto).sum()
                 st.caption(f"Total pagado: {fmt_colones(total_pagado)} en {len(pag_cliente)} pagos")
+
+            # ── Documentos en Drive ──
+            st.markdown("#### 📂 Documentos en Drive")
+            folders = drive_get_client_folder(det_id, doc_nombre if 'doc_nombre' in dir() else det_row.get(COL_NOMBRE, ''), det_row.get("Tipo de Red", "FTTH"))
+            if folders:
+                for subcarpeta, nombre_sub, icono in [
+                    ("contratos", "Contratos", "📄"),
+                    ("comprobantes", "Comprobantes de Pago", "🧾"),
+                    ("documentos", "Documentos (Cédulas, Fotos)", "📎"),
+                ]:
+                    folder_id = folders.get(subcarpeta)
+                    if folder_id:
+                        archivos = drive_list_files(folder_id)
+                        if archivos:
+                            st.markdown(f"**{icono} {nombre_sub}** ({len(archivos)} archivos)")
+                            for arch in archivos:
+                                link = arch.get("webViewLink", "")
+                                nombre = arch.get("name", "")
+                                fecha = arch.get("createdTime", "")[:10] if arch.get("createdTime") else ""
+                                st.markdown(f"- [{nombre}]({link}) {'— ' + fecha if fecha else ''}")
+                        else:
+                            st.caption(f"{icono} {nombre_sub}: sin archivos")
+            else:
+                st.caption("📂 Sin carpeta en Drive (se creará al subir el primer archivo)")
 
     st.markdown("---")
     tab_edit, tab_alta, tab_baja, tab_docs = st.tabs(["✏️ Editar Cliente", "➕ Alta de Cliente", "🚫 Dar de Baja", "📂 Documentos"])

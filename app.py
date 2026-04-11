@@ -129,7 +129,8 @@ def _drive_find_folder(service, name, parent_id):
     """Busca una carpeta por nombre dentro de un parent. Retorna ID o None."""
     try:
         query = f"name='{name}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-        results = service.files().list(q=query, fields="files(id,name)", pageSize=1).execute()
+        results = service.files().list(q=query, fields="files(id,name)", pageSize=1,
+                                        supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
         files = results.get("files", [])
         return files[0]["id"] if files else None
     except Exception:
@@ -143,7 +144,7 @@ def _drive_create_folder(service, name, parent_id):
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [parent_id],
         }
-        folder = service.files().create(body=metadata, fields="id").execute()
+        folder = service.files().create(body=metadata, fields="id", supportsAllDrives=True).execute()
         return folder.get("id")
     except Exception:
         return None
@@ -207,7 +208,7 @@ def drive_upload_file(file_data, filename, folder_id, mime_type=None):
             else:
                 mime_type = "application/octet-stream"
         media = MediaIoBaseUpload(io.BytesIO(file_data), mimetype=mime_type)
-        uploaded = service.files().create(body=metadata, media_body=media, fields="id,webViewLink").execute()
+        uploaded = service.files().create(body=metadata, media_body=media, fields="id,webViewLink", supportsAllDrives=True).execute()
         return uploaded
     except Exception as e:
         st.error(f"Error subiendo archivo: {e}")

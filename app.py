@@ -1858,13 +1858,124 @@ elif pagina == "💰 Pagos":
 
             # Mostrar descarga
             with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
                 st.download_button(
                     label="⬇️ Descargar Comprobante PDF",
-                    data=f.read(),
+                    data=pdf_bytes,
                     file_name=f"comprobante_{pago_id_sel}.pdf",
                     mime="application/pdf",
                 )
             st.success(f"✅ Comprobante generado: comprobante_{pago_id_sel}.pdf")
+
+            # ── Enviar comprobante al cliente ──
+            st.markdown("---")
+            st.markdown("**📤 Enviar comprobante al cliente**")
+
+            # Buscar datos del cliente
+            df_cli_envio = load_clientes()
+            cli_envio = df_cli_envio[df_cli_envio[COL_ID_CLIENTE] == row_pago.get("cliente_id", "")]
+            correo_cliente = ""
+            celular_cliente = ""
+            if not cli_envio.empty:
+                correo_cliente = str(cli_envio.iloc[0].get(COL_CORREO, "")).strip()
+                celular_cliente = str(cli_envio.iloc[0].get(COL_CELULAR, "")).strip()
+                if not celular_cliente:
+                    celular_cliente = str(cli_envio.iloc[0].get(COL_TELEFONO, "")).strip()
+
+            env1, env2 = st.columns(2)
+
+            # Botón Email
+            with env1:
+                if correo_cliente and correo_cliente != "nan":
+                    st.markdown(f"📧 Correo: **{correo_cliente}**")
+                    if st.button("📧 Enviar por Email", key="btn_enviar_email_comp"):
+                        try:
+                            import smtplib
+                            from email.mime.multipart import MIMEMultipart
+                            from email.mime.base import MIMEBase
+                            from email.mime.text import MIMEText
+                            from email import encoders
+
+                            nombre_cli = row_pago.get("nombre_cliente", "Cliente")
+                            monto_cli = fmt_colones(int(parse_monto(row_pago.get("monto", "0"))))
+                            mes_cli = row_pago.get("mes_facturado", "")
+
+                            # Crear mensaje
+                            msg = MIMEMultipart()
+                            msg["From"] = "comprobantes@telcosur.net"
+                            msg["To"] = correo_cliente
+                            msg["Subject"] = f"Comprobante de Pago - Telcosur CR - {mes_cli}"
+
+                            body = f"""Estimado/a {nombre_cli},
+
+Le confirmamos que hemos recibido su pago por {monto_cli} correspondiente al mes {mes_cli}.
+
+Adjuntamos el comprobante de pago para su registro.
+
+Gracias por su preferencia.
+
+Atentamente,
+Telcosur CR
+📞 Soporte: contacto@telcosur.net"""
+
+                            msg.attach(MIMEText(body, "plain"))
+
+                            # Adjuntar PDF
+                            with open(pdf_path, "rb") as attachment:
+                                part = MIMEBase("application", "pdf")
+                                part.set_payload(attachment.read())
+                                encoders.encode_base64(part)
+                                part.add_header("Content-Disposition", f"attachment; filename=comprobante_{pago_id_sel}.pdf")
+                                msg.attach(part)
+
+                            # Enviar (SMTP de Google Workspace)
+                            if "smtp" in st.secrets:
+                                smtp_server = st.secrets["smtp"].get("server", "smtp.gmail.com")
+                                smtp_port = int(st.secrets["smtp"].get("port", 587))
+                                smtp_user = st.secrets["smtp"]["user"]
+                                smtp_pass = st.secrets["smtp"]["password"]
+                                with smtplib.SMTP(smtp_server, smtp_port) as server:
+                                    server.starttls()
+                                    server.login(smtp_user, smtp_pass)
+                                    server.send_message(msg)
+                                st.success(f"✅ Email enviado a {correo_cliente}")
+                            else:
+                                st.warning("⚠️ SMTP no configurado. Agregá las credenciales en Streamlit Secrets.")
+                                st.code(f"""[smtp]
+server = "smtp.gmail.com"
+port = 587
+user = "tu-correo@telcosur.net"
+password = "tu-contraseña-de-app" """, language="toml")
+                        except Exception as e:
+                            st.error(f"Error enviando email: {e}")
+                else:
+                    st.caption("📧 Cliente sin correo registrado")
+
+            # Botón WhatsApp
+            with env2:
+                if celular_cliente and celular_cliente != "nan":
+                    # Limpiar número: quitar espacios, guiones, etc.
+                    cel_limpio = celular_cliente.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+                    # Agregar código de país si no tiene
+                    if not cel_limpio.startswith("+") and not cel_limpio.startswith("506"):
+                        cel_limpio = "506" + cel_limpio
+
+                    nombre_cli = row_pago.get("nombre_cliente", "Cliente")
+                    monto_cli = fmt_colones(int(parse_monto(row_pago.get("monto", "0"))))
+                    mes_cli = row_pago.get("mes_facturado", "")
+
+                    mensaje_wa = (
+                        f"Hola {nombre_cli}, le confirmamos que recibimos su pago de "
+                        f"{monto_cli} correspondiente al mes {mes_cli}. "
+                        f"Gracias por su pago puntual. - Telcosur CR"
+                    )
+                    import urllib.parse
+                    wa_url = f"https://wa.me/{cel_limpio}?text={urllib.parse.quote(mensaje_wa)}"
+
+                    st.markdown(f"📱 Celular: **{celular_cliente}**")
+                    st.markdown(f"[💬 Enviar por WhatsApp]({wa_url})")
+                else:
+                    st.caption("📱 Cliente sin celular registrado")
 
         # Gráfico de cobros por mes
         if not df_p.empty:

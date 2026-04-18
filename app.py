@@ -1074,6 +1074,103 @@ Departamento de Cobros – Telcosur CR"""
             "La línea muestra la pérdida acumulada (cada baja sigue impactando mes a mes)."
         )
 
+    st.markdown("---")
+
+    # ── Nuevas Instalaciones del Mes ──
+    st.subheader("🆕 Nuevas Instalaciones del Mes")
+
+    df_c_inst = df_c.copy()
+    df_c_inst["_fecha_inst_dt"] = pd.to_datetime(df_c_inst.get("Fecha Instalacion", ""), dayfirst=True, errors="coerce")
+    df_c_inst["_fecha_1fac_dt"] = pd.to_datetime(df_c_inst.get(COL_FECHA_1FAC, ""), dayfirst=True, errors="coerce")
+    # Usar la mejor fecha disponible
+    df_c_inst["_fecha_alta"] = df_c_inst["_fecha_inst_dt"].fillna(df_c_inst["_fecha_1fac_dt"])
+
+    mes_actual = pd.Timestamp.now().to_period("M")
+    instalaciones_mes = df_c_inst[df_c_inst["_fecha_alta"].dt.to_period("M") == mes_actual].copy()
+
+    if not instalaciones_mes.empty:
+        instalaciones_mes["Fecha"] = instalaciones_mes["_fecha_alta"].dt.strftime("%d/%m/%Y")
+        inst_display = instalaciones_mes[[COL_ID_CLIENTE, COL_NOMBRE, "Tipo de Red", COL_MEGAS, COL_MONTO, "Fecha"]].copy()
+        inst_display[COL_MONTO] = inst_display[COL_MONTO].apply(lambda x: fmt_colones(parse_monto(x)))
+        inst_display = inst_display.rename(columns={
+            COL_ID_CLIENTE: "ID", COL_NOMBRE: "Cliente",
+            COL_MEGAS: "Megas", COL_MONTO: "Monto/mes",
+        }).sort_values("Fecha", ascending=False)
+
+        st.dataframe(inst_display, use_container_width=True, hide_index=True)
+
+        ingreso_nuevo = instalaciones_mes[COL_MONTO].apply(parse_monto).sum()
+        st.metric(f"Nuevos clientes {mes_actual}", f"{len(instalaciones_mes)} clientes — {fmt_colones(ingreso_nuevo)}/mes")
+    else:
+        st.info(f"Sin nuevas instalaciones en {mes_actual}.")
+
+    # ── Historial de Instalaciones por Mes (gráfico) ──
+    st.markdown("#### 📈 Historial de Crecimiento – Instalaciones por Mes")
+
+    df_c_hist = df_c_inst[df_c_inst["_fecha_alta"].notna()].copy()
+    df_c_hist["mes_alta"] = df_c_hist["_fecha_alta"].dt.to_period("M").astype(str)
+
+    if not df_c_hist.empty:
+        # Contar instalaciones por mes y tipo de red
+        inst_por_mes = df_c_hist.groupby(["mes_alta", "Tipo de Red"]).size().reset_index(name="instalaciones")
+        inst_total_mes = df_c_hist.groupby("mes_alta").size().reset_index(name="total")
+        inst_total_mes["acumulado"] = inst_total_mes["total"].cumsum()
+        inst_total_mes = inst_total_mes.sort_values("mes_alta").tail(12)
+
+        # Ingreso nuevo por mes
+        df_c_hist["_monto_num"] = df_c_hist[COL_MONTO].apply(parse_monto)
+        ingreso_por_mes = df_c_hist.groupby("mes_alta")["_monto_num"].sum().reset_index()
+        ingreso_por_mes.columns = ["mes_alta", "ingreso_nuevo"]
+        ingreso_por_mes = ingreso_por_mes.sort_values("mes_alta").tail(12)
+
+        fig_inst = go.Figure()
+
+        # Barras por tipo de red
+        colores_red = {"FTTH": "#38bdf8", "Inalambrico": "#a78bfa", "TerraNetwork": "#fb923c", "Empresarial": "#4ade80"}
+        for red in inst_por_mes["Tipo de Red"].unique():
+            data_red = inst_por_mes[inst_por_mes["Tipo de Red"] == red]
+            fig_inst.add_bar(
+                x=data_red["mes_alta"], y=data_red["instalaciones"],
+                name=red, marker_color=colores_red.get(red, "#94a3b8"),
+            )
+
+        # Línea acumulada
+        fig_inst.add_scatter(
+            x=inst_total_mes["mes_alta"], y=inst_total_mes["acumulado"],
+            name="Total Acumulado", mode="lines+markers",
+            line=dict(color="#fbbf24", width=3), marker=dict(size=8),
+            yaxis="y2",
+        )
+
+        fig_inst.update_layout(
+            barmode="stack",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#cbd5e1",
+            legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h", y=-0.15),
+            xaxis_title="Mes", yaxis_title="Instalaciones Nuevas",
+            yaxis2=dict(title="Total Acumulado", overlaying="y", side="right", showgrid=False),
+            height=400,
+        )
+        st.plotly_chart(fig_inst, use_container_width=True)
+
+        # Gráfico de ingreso nuevo por mes
+        st.markdown("#### 💰 Ingreso Nuevo Generado por Mes (nuevas altas)")
+        fig_ing = go.Figure()
+        fig_ing.add_bar(
+            x=ingreso_por_mes["mes_alta"], y=ingreso_por_mes["ingreso_nuevo"],
+            name="Ingreso Nuevo", marker_color="#4ade80",
+            text=ingreso_por_mes["ingreso_nuevo"].apply(lambda x: fmt_colones(x)),
+            textposition="outside",
+        )
+        fig_ing.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#cbd5e1", height=350,
+            yaxis_tickformat=",.0f", xaxis_title="Mes", yaxis_title="Ingreso Nuevo (₡)",
+        )
+        st.plotly_chart(fig_ing, use_container_width=True)
+
+        st.caption("Muestra el ingreso mensual recurrente que generan los nuevos clientes instalados cada mes.")
+
 
 # ═════════════════════════════════════════════
 #          GENERAR FACTURAS DEL MES
